@@ -1,0 +1,111 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+from tempfile import NamedTemporaryFile
+import urllib
+import xml.etree
+
+import flickrapi
+
+from config import *
+
+flickr      = flickrapi.FlickrAPI( api_key, api_secret )
+
+(token, frob) = flickr.get_token_part_one( perms='write' )
+if not token: raw_input("Press ENTER after you authorized this program")
+flickr.get_token_part_two( (token, frob) )
+
+source_user     = flickr.people_findByUsername( username=source_username )[0]
+source_user     = flickr.people_getInfo( user_id=source_user.attrib['nsid'] )[0]
+
+target_user     = flickr.people_findByUsername( username=target_username )[0]
+target_user     = flickr.people_getInfo( user_id=target_user.attrib['nsid'] )[0]
+
+user_photos_url = source_user.find( 'photosurl' ).text
+username        = source_user.find( 'username' ).text
+# TODO: Skip photos whose uploaded date/time is prior to last run
+photos          = flickr.photos_search( user_id=source_user.attrib['nsid'], tags=source_tag, tag_mode='all', sort='date-posted-asc', per_page=500 )
+
+temp_file = NamedTemporaryFile()
+
+photo_map = {}
+photosets = {}
+for photo in photos.find( 'photos' ):
+    photo_id = photo.attrib['id']
+    info     = flickr.photos_getInfo( photo_id=photo_id )[0]
+    title    = info.find( 'title' ).text
+    tags     = base_tags.substitute( user=username, id=photo_id )
+    
+    # Skip already uploaded pictures
+    extant_photos = flickr.photos_search( user_id=target_user.attrib['nsid'], tags=tags, tag_mode='all' )[0]
+    if extant_photos is not None and 0 < len( extant_photos ):
+        photo_map[photo_id] = extant_photos[0].attrib['id'] 
+        print 'Skipped "%s" (%s)' % ( title, photo_id )
+        continue
+    
+    print 'Mirroring "%s" (%s)' % ( title, photo_id )
+    
+    url = image_url.substitute( \
+          farm_id=photo.attrib['farm'], \
+        server_id=photo.attrib['server'], \
+               id=photo_id, \
+           secret=photo.attrib['secret'] \
+    )
+    image = urllib.URLopener()
+    image.retrieve( url, temp_file.name )
+    
+    photopage   = base_url.substitute( photos_url=user_photos_url, id=photo_id )
+    description = base_description.substitute( photo_url=photopage )
+    
+    new_id = flickr.upload( filename=temp_file.name, title=title, description=description, tags=tags )
+    
+    new_id = new_id[0].text
+    photo_map[photo_id] = new_id
+    
+    print 'Uploaded "%s" (%s->%s)' % ( title, photo_id, new_id )
+    
+    contexts = flickr.photos_getAllContexts( photo_id=photo_id )
+    for photoset in contexts:
+        if not photosets.has_key( photoset.attrib['id'] ):
+            photosets[photoset.attrib['id']] = []
+        photosets[photoset.attrib['id']].append( photo_id )
+    
+    print 'Done "%s" (%s->%s)' % ( title, photo_id, new_id )
+
+for photoset_id in photosets:
+    info        = flickr.photosets_getInfo( photoset_id=photoset_id )[0]
+    title       = info.find( 'title' ).text
+    print 'Building mirror of set "%s"' % title
+    
+    set_url     = base_set_url.substitute(
+         photos_url=user_photos_url,
+        photoset_id=photoset_id
+    )
+    description = base_set_description.substitute(
+        description=info.find( 'description' ).text,
+            set_url=set_url
+    )
+    
+    # Create the new set
+    # TODO: Only create if not already extant
+    new_set_id = flickr.photosets_create( 
+                   title=title,
+             description=description,
+        primary_photo_id=photo_map[info.attrib['primary']]
+    )
+    new_set_id = new_set_id[0].attrib['id']
+    
+    # Get the photos for the set
+    photos = flickr.photosets_getPhotos( photoset_id=photoset_id )[0]
+    mapped_photos = [ photo_map[photo.attrib['id']] for photo in photos ]
+    mapped_photos = ','.join( mapped_photos )
+    
+    # Add all the photos
+    flickr.photosets_editPhotos(
+             photoset_id=new_set_id,
+        primary_photo_id=photo_map[info.attrib['primary']],
+               photo_ids=mapped_photos
+    )
+    print 'Built mirror of set "%s"' % title
+
+print 'Done'
